@@ -134,8 +134,10 @@ def print_summary(df: pd.DataFrame, categories: dict):
     print(f"  {'Category Code':<35} {'Matched':>8}  {'%':>6}")
     print("-" * 60)
 
-    # Parse the JSON column once
-    parsed = df["keyphrase_stats"].apply(json.loads)
+    # Parse the JSON column once — treat NaN/None as empty dict
+    parsed = df["keyphrase_stats"].apply(
+        lambda v: json.loads(v) if isinstance(v, str) else {}
+    )
 
     for code in categories:
         n = parsed.apply(lambda d: bool(d.get(code))).sum()
