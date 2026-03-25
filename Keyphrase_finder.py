@@ -116,9 +116,10 @@ def build_keyphrase_stats(text: str, categories: dict) -> str:
             hits = re.findall(r"\b" + re.escape(term) + r"\b", text)
             if hits:
                 counts[term] = len(hits)
-        result[code] = counts   # empty dict {} if nothing matched
+        if counts:                  # only include category if at least one term matched
+            result[code] = counts
 
-    return json.dumps(result, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False) if result else None
 
 
 # ══════════════════════════════════════════════════════════════
