@@ -2,11 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 Hydro One Email Intent Classifier
-FULL TELEMETRY VERSION (v4.3.0)
+FULL TELEMETRY VERSION (v4.4.0)
 Reduced Knowledgebase + Human-Style Hybrid Prompt
 No Few-Shots | No .env | All config via CLI arguments
 
-GGUF / llama.cpp best practices applied (v4.3.0):
+Mistral 7B Instruct v0.2 prompt alignment (v4.4.0):
+  - <s> BOS token added to full_prompt (official requirement)
+  - System prompt prepended inside [INST] (no native system role in v0.2)
+  - add_bos=False in Llama() to prevent double BOS
+  - top_p lowered 0.95 -> 0.90 (tighter nucleus for classification)
+  - top_k lowered 40   -> 10   (more deterministic JSON output)
+
+GGUF / llama.cpp best practices (v4.3.0):
   - n_threads set to physical cores via psutil (not logical)
   - use_mlock optional: pins model weights in RAM during batch run
   - flash_attn optional: 20-40% faster prompt processing on AVX2/AVX512
@@ -64,7 +71,7 @@ except ImportError:
 # VERSION
 # --------------------------------------------------
 
-APP_VERSION     = "4.3.0"
+APP_VERSION     = "4.4.0"
 DEFAULT_OUT_COL = "Predicted_Reduced_Category"
 
 # Prompt budget constants
@@ -111,8 +118,8 @@ class Config:
     n_batch:        int   = 512
     max_tokens:     int   = 256
     temperature:    float = 0.05
-    top_p:          float = 0.95
-    top_k:          int   = 40
+    top_p:          float = 0.90   # tighter nucleus — reduces sampling pool for classification
+    top_k:          int   = 10     # fewer candidates — more deterministic JSON output
     repeat_penalty: float = 1.1
     max_keywords:   int   = 5
 
@@ -604,7 +611,11 @@ def predict_intent(
     GGUF stop tokens include [/INST] to prevent Mistral runaway generation.
     """
     user_prompt   = build_user_prompt(subject, body)
-    full_prompt   = f"[INST] {system_prompt}\n\n{user_prompt} [/INST]"
+    # <s> BOS token required by Mistral 7B Instruct v0.2 official format.
+    # add_bos=False in Llama() so we add it manually — avoids double BOS.
+    # Mistral v0.2 has no native system role; system prompt is prepended
+    # inside [INST] alongside the user message — the correct pattern.
+    full_prompt   = f"<s>[INST] {system_prompt}\n\n{user_prompt} [/INST]"
     prompt_tokens = len(model.tokenize(full_prompt.encode("utf-8")))
 
     if cfg.log_prompts or cfg.run_mode in ("dev", "test"):
@@ -1246,7 +1257,7 @@ def run(cfg: Config) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Hydro One Email Intent Classifier v4.3.0",
+        description="Hydro One Email Intent Classifier v4.4.0",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1274,8 +1285,10 @@ def build_parser() -> argparse.ArgumentParser:
     llm.add_argument("--n-batch",        dest="n_batch",        type=int,   default=512)
     llm.add_argument("--max-tokens",     dest="max_tokens",     type=int,   default=256)
     llm.add_argument("--temperature",    dest="temperature",    type=float, default=0.05)
-    llm.add_argument("--top-p",          dest="top_p",          type=float, default=0.95)
-    llm.add_argument("--top-k",          dest="top_k",          type=int,   default=40)
+    llm.add_argument("--top-p",          dest="top_p",          type=float, default=0.90,
+                     help="Nucleus sampling. 0.90 recommended for classification (tighter than creative tasks).")
+    llm.add_argument("--top-k",          dest="top_k",          type=int,   default=10,
+                     help="Top-k sampling. 10 recommended for classification (more deterministic JSON output).")
     llm.add_argument("--repeat-penalty", dest="repeat_penalty", type=float, default=1.1)
     llm.add_argument("--max-keywords",   dest="max_keywords",   type=int,   default=5)
 
