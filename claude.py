@@ -2,38 +2,47 @@
 # -*- coding: utf-8 -*-
 """
 Hydro One Email Intent Classifier
-FULL TELEMETRY VERSION (v4.4.0)
+FULL TELEMETRY VERSION (v4.6.0)
 Reduced Knowledgebase + Human-Style Hybrid Prompt
-No Few-Shots | No .env | All config via CLI arguments
+No .env | All config via CLI arguments
+
+Mistral official prompting best practices applied (v4.6.0):
+  - Markdown # headers replace -- SECTION -- plain text (model familiar from training)
+  - Decision tree replaces numbered steps (eliminates priority contradictions)
+  - Explicit tie-breaking rules replace blurry "strongest alignment" language
+  - 2 few-shot examples added (recommended by docs for output format compliance)
+
+[INST] prompt alignment (v4.5.0):
+  - Single \\n between system prompt and email data (matches training distribution)
+  - Email data goes directly after instruction — no redundant preamble
+  - Format: <s>[INST] {system}\\n{subject}\\nBody:\\n{body} [/INST]
 
 Mistral 7B Instruct v0.2 prompt alignment (v4.4.0):
-  - <s> BOS token added to full_prompt (official requirement)
+  - <s> BOS token added (official requirement)
   - System prompt prepended inside [INST] (no native system role in v0.2)
-  - add_bos=False in Llama() to prevent double BOS
-  - top_p lowered 0.95 -> 0.90 (tighter nucleus for classification)
-  - top_k lowered 40   -> 10   (more deterministic JSON output)
+  - add_bos=False in Llama() prevents double BOS
+  - top_p 0.95 → 0.90, top_k 40 → 10 (tighter for classification)
 
 GGUF / llama.cpp best practices (v4.3.0):
-  - n_threads set to physical cores via psutil (not logical)
-  - use_mlock optional: pins model weights in RAM during batch run
-  - flash_attn optional: 20-40% faster prompt processing on AVX2/AVX512
-  - stop tokens include [/INST] to prevent Mistral runaway generation
-  - use_mmap=True (default): fast model load via memory mapping
+  - n_threads = physical cores via psutil
+  - use_mlock optional: pins weights in RAM
+  - flash_attn optional: faster on AVX2/AVX512
+  - [/INST] in stop tokens: prevents runaway generation
+  - use_mmap=True: fast model load
 
 Prompt size management (v4.2.0):
-  1. Dynamic body budget  — derived from actual system prompt token count
-  2. System prompt budget check — warns at startup if oversized
-  3. Tiered body truncation — paragraph > sentence > hard cut
-  4. Compact hints format — single dense line per category
-  5. KV-cache prefix reuse — last_n_tokens_size=n_ctx
+  1. Dynamic body budget from actual system prompt token count
+  2. System prompt budget check at startup
+  3. Tiered body truncation: paragraph > sentence > hard cut
+  4. Compact hints format
+  5. KV-cache prefix reuse
 
 Data integrity guarantees (v4.3.0):
-  - Every row gets an llm_called flag (True/False)
-  - Every row gets a processing_status column with full audit trail
-  - Row count reconciliation check at end of pipeline
-  - Skipped rows (empty input) are flagged, not silently classified
-  - Exception rows are flagged with error detail, not silently unclassified
-  - Final integrity report logged and written to manifest
+  - llm_called flag per row
+  - processing_status audit column per row
+  - Row count reconciliation after pipeline
+  - Skipped/error rows explicitly flagged
+  - Integrity report in manifest
 """
 
 from __future__ import annotations
@@ -71,7 +80,7 @@ except ImportError:
 # VERSION
 # --------------------------------------------------
 
-APP_VERSION     = "4.4.0"
+APP_VERSION     = "4.7.0"
 DEFAULT_OUT_COL = "Predicted_Reduced_Category"
 
 # Prompt budget constants
@@ -338,47 +347,125 @@ def build_system_prompt(
     category_terms:  Dict[str, List[str]],
     max_keywords:    int = 5,
 ) -> str:
+    """
+    Builds the system prompt aligned with Mistral official prompting best practices:
+
+    Fix 1 — Markdown headers replace -- SECTION -- plain text.
+             Markdown is explicitly recommended by docs as familiar to the model
+             from training, readable, and parsable.
+
+    Fix 2 — Decision tree replaces numbered steps with potential contradictions.
+             Docs recommend if/otherwise branching to eliminate ambiguity.
+
+    Fix 3 — "Strongest alignment" replaced with explicit tie-breaking rules.
+             Docs say to avoid blurry words like "strongest", "better", "most".
+
+    Fix 4 — Two few-shot examples added.
+             Docs explicitly recommend examples to improve output format compliance,
+             calling it the most effective tool for consistent JSON structure.
+             Examples are placed AFTER the rules so the model sees the format
+             instruction first, then sees it demonstrated.
+    """
+
+    # Fix 1: Markdown header for output format block
     output_block = textwrap.dedent("""
-        -- OUTPUT FORMAT (READ THIS FIRST) --
+        # Output Format
         Return ONLY a single JSON object. No explanation. No preamble. No markdown.
         Required structure:
         {"intent_category":"<CAT>","intent_code":"<CAT>","confidence":"<LEVEL>","all_intents":["<CAT1>"]}
-        - intent_category and intent_code MUST be identical and one of the ALLOWED CATEGORIES
+        - intent_category and intent_code MUST be identical and from Allowed Categories below
         - confidence: "high" | "medium" | "low"
         - all_intents: every plausible category detected (minimum one)
-        - Entire response = this JSON only, nothing else
+        - Your ENTIRE response must be this JSON object — nothing before or after it
     """).strip()
 
-    allowed_block = "-- ALLOWED CATEGORIES --\n" + "\n".join(
-        f"  {c}" for c in category_labels
+    # Fix 1: Markdown header for allowed categories
+    allowed_block = "# Allowed Categories\n" + "\n".join(
+        f"- {c}" for c in category_labels
     )
 
+    # Fix 1: Markdown header for hints (compact format preserved for token efficiency)
     compact_hints = []
     for code in category_labels:
         terms = category_terms.get(code, [])
         if terms:
             deduped = list(dict.fromkeys(t.lower().strip() for t in terms if t.strip()))
             deduped_sorted = sorted(deduped, key=lambda t: (len(t.split()), len(t)))
-            compact_hints.append(f"{code}={','.join(deduped_sorted[:max_keywords])}")
+            compact_hints.append(f"- {code}: {', '.join(deduped_sorted[:max_keywords])}")
 
-    hints_block = "-- HINTS --\n" + " | ".join(compact_hints)
+    hints_block = "# Keyword Hints\nUse these as supporting signals only — not strict rules.\n" + "\n".join(compact_hints)
 
+    # Fix 2 + 3: Decision tree — billing priority moved to TOP (root cause fix).
+    # Rule is now unconditional — no "among plausible" ambiguity.
+    # Model reads billing override BEFORE any other reasoning branch.
     rules_block = textwrap.dedent("""
-        -- STEPS --
-        1. EDGE CASES: bounce/mailer-daemon/auto-reply -> "Undeliverable" high. Empty email -> "Unclassified" low. Stop.
-        2. Read Subject+Body together. What does the customer want?
-        3. List all plausible categories. Hints are clues, not rules.
-        4. PRIORITY: Billing & Payments detected -> always pick it. One match -> pick it.
-           Multiple non-billing -> strongest alignment. No match -> "Unclassified".
-        5. Confidence: high=clear match | medium=some ambiguity | low=weak/conflicting
+        # Classification Decision Tree
+        Follow these branches in order. Stop at the first match.
+
+        - IF the email is a delivery failure, bounce, mailer-daemon, or auto-reply:
+            → intent_category = "Undeliverable", confidence = "high". STOP.
+
+        - IF subject and body are both empty or contain only whitespace:
+            → intent_category = "Unclassified", confidence = "low". STOP.
+
+        - IF the email mentions anything related to bills, invoices, payments, charges,
+          amounts owed, account balances, or payment methods — even if other topics
+          are also present:
+            → intent_category = "Billing & Payments". ALWAYS. No exceptions. STOP.
+            This rule overrides ALL other category matches without exception.
+
+        - IF exactly one category matches the email meaning and keywords:
+            → intent_category = that category. STOP.
+
+        - IF multiple non-billing categories match:
+            → Choose the category whose keywords appear in BOTH subject AND body.
+            → If tied: choose the category with the most keyword matches in the body.
+            → If still tied: choose the category whose first keyword appears earliest in the email.
+            STOP.
+
+        - IF no category fits with reasonable confidence:
+            → intent_category = "Unclassified", confidence = "low". STOP.
+
+        # Confidence Scale
+        - high: subject AND body clearly match one category, multiple keyword hits
+        - medium: reasonable match in body but subject is vague, or keywords partially match
+        - low: weak signals only, conflicting intents, or forced best-guess
+    """).strip()
+
+    # Few-shot examples:
+    # Example 1 deliberately shows MULTI-INTENT scenario where billing overrides another intent.
+    # This is the exact failure case observed in production — billing detected but not selected.
+    # Example 2 shows clean single-category match (outage).
+    fewshot_block = textwrap.dedent("""
+        # Examples
+
+        ## Example 1 — Billing override (multi-intent email)
+        Subject: I need to update my address and I also have a question about my bill
+        Body:
+        Hi, I recently moved and need to update my mailing address on my account. I also noticed my last bill had some charges I don't recognize. Can you help with both?
+        Answer: {"intent_category":"Billing & Payments","intent_code":"Billing & Payments","confidence":"high","all_intents":["Billing & Payments","Move In / Move Out"]}
+
+        ## Example 2 — Single intent (outage)
+        Subject: Power has been out since last night on my street
+        Body:
+        Our entire street lost power around 10pm yesterday. I have a medical device that requires electricity. Please send a crew to restore power as soon as possible.
+        Answer: {"intent_category":"Outage & Restoration","intent_code":"Outage & Restoration","confidence":"high","all_intents":["Outage & Restoration"]}
     """).strip()
 
     header = (
         "You are an expert email intent classifier for Hydro One, a Canadian electric utility.\n"
-        "Classify customer emails into exactly one intent category. Return valid JSON only."
+        "Your task is to classify each customer email into exactly one intent category.\n"
+        "Return valid JSON only — no explanation, no preamble, no markdown fences."
     )
 
-    return "\n\n".join([header, output_block, allowed_block, hints_block, rules_block]).strip()
+    return "\n\n".join([
+        header,
+        output_block,
+        allowed_block,
+        hints_block,
+        rules_block,
+        fewshot_block,
+    ]).strip()
 
 
 # --------------------------------------------------
@@ -418,13 +505,12 @@ def prepare_subject_body(subject: str, body: str, budget: PromptBudget) -> Tuple
 
 
 def build_user_prompt(subject: str, body: str) -> str:
-    return textwrap.dedent(f"""
-        Classify this email:
-
-        Subject: {subject}
-        Body:
-        {body}
-    """).strip()
+    """
+    Builds the user-facing portion of the prompt for telemetry logging.
+    Matches the data section of the [INST] block exactly —
+    no redundant preamble, data goes straight after the system instruction.
+    """
+    return f"Subject: {subject}\nBody:\n{body}"
 
 
 # --------------------------------------------------
@@ -610,12 +696,20 @@ def predict_intent(
 
     GGUF stop tokens include [/INST] to prevent Mistral runaway generation.
     """
-    user_prompt   = build_user_prompt(subject, body)
-    # <s> BOS token required by Mistral 7B Instruct v0.2 official format.
-    # add_bos=False in Llama() so we add it manually — avoids double BOS.
-    # Mistral v0.2 has no native system role; system prompt is prepended
-    # inside [INST] alongside the user message — the correct pattern.
-    full_prompt   = f"<s>[INST] {system_prompt}\n\n{user_prompt} [/INST]"
+    # Official Mistral 7B Instruct v0.2 format from promptingguide.ai:
+    #   <s>[INST] {instruction + data} [/INST]
+    # - Single \n between system prompt and email data (not \n\n)
+    # - Data goes directly after instruction — no redundant preamble
+    # - <s> BOS added manually; add_bos=False in Llama() avoids double BOS
+    # - Mistral v0.2 has no native system role; everything lives in [INST]
+    user_prompt = (
+        f"Subject: {subject}\n"
+        f"Body:\n{body}"
+    )
+    full_prompt = (
+        f"<s>[INST] {system_prompt}\n"
+        f"{user_prompt} [/INST]"
+    )
     prompt_tokens = len(model.tokenize(full_prompt.encode("utf-8")))
 
     if cfg.log_prompts or cfg.run_mode in ("dev", "test"):
@@ -1257,7 +1351,7 @@ def run(cfg: Config) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Hydro One Email Intent Classifier v4.4.0",
+        description="Hydro One Email Intent Classifier v4.6.0",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
