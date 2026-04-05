@@ -2,9 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Hydro One Email Intent Classifier
-FULL TELEMETRY VERSION (v4.6.0)
+FULL TELEMETRY VERSION (v4.7.0)
 Reduced Knowledgebase + Human-Style Hybrid Prompt
 No .env | All config via CLI arguments
+
+Billing priority fixes (v4.7.0):
+  - Keyword Hints section no longer says "supporting signals only" (contradicted billing rule)
+  - Billing & Payments keywords now marked as MANDATORY triggers in hints header
+  - Billing trigger condition expanded with more financial keywords
+  - Third few-shot example added: implicit financial language → Billing & Payments
 
 Mistral official prompting best practices applied (v4.6.0):
   - Markdown # headers replace -- SECTION -- plain text (model familiar from training)
@@ -393,7 +399,13 @@ def build_system_prompt(
             deduped_sorted = sorted(deduped, key=lambda t: (len(t.split()), len(t)))
             compact_hints.append(f"- {code}: {', '.join(deduped_sorted[:max_keywords])}")
 
-    hints_block = "# Keyword Hints\nUse these as supporting signals only — not strict rules.\n" + "\n".join(compact_hints)
+    hints_block = (
+        "# Keyword Hints\n"
+        "Use these to identify likely categories.\n"
+        "IMPORTANT: Billing & Payments keywords are MANDATORY triggers — when present,\n"
+        "they override all other categories (see Classification Decision Tree below).\n"
+        + "\n".join(compact_hints)
+    )
 
     # Fix 2 + 3: Decision tree — billing priority moved to TOP (root cause fix).
     # Rule is now unconditional — no "among plausible" ambiguity.
@@ -409,7 +421,9 @@ def build_system_prompt(
             → intent_category = "Unclassified", confidence = "low". STOP.
 
         - IF the email mentions anything related to bills, invoices, payments, charges,
-          amounts owed, account balances, or payment methods — even if other topics
+          amounts owed, account balances, payment methods, rates, fees, late fees,
+          overdue amounts, statements, billing cycles, refunds, credits, auto-pay,
+          pre-authorized payments, or any financial transaction — even if other topics
           are also present:
             → intent_category = "Billing & Payments". ALWAYS. No exceptions. STOP.
             This rule overrides ALL other category matches without exception.
@@ -450,6 +464,12 @@ def build_system_prompt(
         Body:
         Our entire street lost power around 10pm yesterday. I have a medical device that requires electricity. Please send a crew to restore power as soon as possible.
         Answer: {"intent_category":"Outage & Restoration","intent_code":"Outage & Restoration","confidence":"high","all_intents":["Outage & Restoration"]}
+
+        ## Example 3 — Billing override (implicit financial language)
+        Subject: Issue with my account
+        Body:
+        I checked my statement online and noticed the amount charged last month was higher than expected. I haven't changed my usage, so I'm not sure why my rate went up. Can someone look into this?
+        Answer: {"intent_category":"Billing & Payments","intent_code":"Billing & Payments","confidence":"high","all_intents":["Billing & Payments"]}
     """).strip()
 
     header = (

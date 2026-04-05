@@ -287,6 +287,21 @@ def build_system_prompt(
         )
     shots_block = "\n".join(shot_lines)
 
+    # Billing override example — always included to reinforce rule 2
+    billing_example = textwrap.dedent("""
+        Example (billing override — multi-topic email):
+          Subject: Address change and billing question
+          Body: I recently moved and need to update my address. Also, my last invoice
+                had charges I don't recognize. Can you explain the billing?
+          -> Intent: Billing  |  Code: Billing
+
+        Example (billing — subtle financial language):
+          Subject: Rate increase on my account
+          Body: I noticed my statement this month shows a higher rate than before.
+                I haven't changed my usage. Please review the charges.
+          -> Intent: Billing  |  Code: Billing
+    """).strip()
+
     return textwrap.dedent(f"""
         You are an email intent classifier for a utility company (Hydroone).
         Your job: read an email's Subject and Body, then return the best matching
@@ -300,13 +315,18 @@ def build_system_prompt(
         {codes_str}
 
         -- CLASSIFICATION EXAMPLES --
+        {billing_example}
         {shots_block}
 
         -- RULES --
         1. Choose EXACTLY ONE code from the ALLOWED INTENT CODES list above.
-        2. If the email is automated/delivery failure/bounce, use: Undeliverable
-        3. If genuinely unclear, use: Unclassified
-        4. Return ONLY valid JSON -- no explanation, no markdown, no extra text.
+        2. If the email mentions bills, invoices, payments, charges, account balances,
+           rates, fees, statements, or any financial transaction — even if other topics
+           are also present — use the billing intent code. This overrides all other
+           categories without exception.
+        3. If the email is automated/delivery failure/bounce, use: Undeliverable
+        4. If genuinely unclear, use: Unclassified
+        5. Return ONLY valid JSON -- no explanation, no markdown, no extra text.
            Format: {{"intent": "<label>", "intent_code": "<Code>"}}
     """).strip()
 
