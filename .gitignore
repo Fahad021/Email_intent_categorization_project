@@ -1,8 +1,24 @@
 # Environment variables / secrets
 .env
 
-# Local model files
+# Config with real paths/secrets (keep config.example.yaml but not the real one with secrets)
+# config.yaml is committed — it holds defaults, not secrets (put secrets in .env)
+
+# Local model files (large binary files)
 *.gguf
+models/
+
+# Data files (potentially large / sensitive)
+data/
+*.parquet
+*.csv
+
+# Output files
+output/
+
+# Logs
+logs/
+*.log
 
 # Python
 __pycache__/

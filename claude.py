@@ -72,9 +72,9 @@ from typing import Optional, Dict, List, Tuple
 from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
+from llama_cpp import Llama
 import pandas as pd
 from tqdm import tqdm
-from llama_cpp import Llama
 
 try:
     import psutil
@@ -116,13 +116,29 @@ class Config:
     # Required paths
     model_path: str
     kb_file:    str
-    parquet_in: str
 
-    # Optional paths
+    # Prompt file (leave blank to use built-in hardcoded prompt)
+    prompt_file: str = ""
+
+    # Data source: "parquet" | "sql"
+    data_source: str = "parquet"
+
+    # Parquet I/O (used when data_source = "parquet")
+    parquet_in:  str           = ""
     parquet_out: Optional[str] = None
     out_col:     str           = DEFAULT_OUT_COL
-    record_dir:  Optional[str] = None
-    log_file:    Optional[str] = None
+
+    # SQL Server (used when data_source = "sql")
+    sql_server:   str  = ""
+    sql_database: str  = "EMAIL"
+    sql_table:    str  = "[dbo].[Original_Email]"
+    sql_trusted:  bool = True
+    sql_batch:    int  = 100
+    sql_dry_run:  bool = False
+
+    # Optional paths
+    record_dir: Optional[str] = None
+    log_file:   Optional[str] = None
 
     # LLM behaviour
     n_ctx:          int   = 8192
@@ -156,10 +172,17 @@ class Config:
     log_prompts: bool = False
 
     def __post_init__(self):
-        self.run_mode  = self.run_mode.lower()
-        self.log_level = self.log_level.upper()
+        self.run_mode   = self.run_mode.lower()
+        self.log_level  = self.log_level.upper()
+        self.data_source = self.data_source.lower()
         if self.run_mode not in ("dev", "test", "prod"):
             raise ValueError(f"run_mode must be dev/test/prod, got: {self.run_mode}")
+        if self.data_source not in ("parquet", "sql"):
+            raise ValueError(f"data_source must be 'parquet' or 'sql', got: {self.data_source}")
+        if self.data_source == "parquet" and not self.parquet_in:
+            raise ValueError("parquet_in is required when data_source = 'parquet'")
+        if self.data_source == "sql" and not self.sql_server:
+            raise ValueError("sql_server is required when data_source = 'sql'")
 
 
 # --------------------------------------------------
@@ -348,30 +371,50 @@ def load_reduced_kb(
 # PROMPT BUILDER
 # --------------------------------------------------
 
+def _render_allowed_categories(category_labels: List[str]) -> str:
+    return "\n".join(f"- {c}" for c in category_labels)
+
+
+def _render_keyword_hints(
+    category_labels: List[str],
+    category_terms:  Dict[str, List[str]],
+    max_keywords:    int,
+) -> str:
+    lines = []
+    for code in category_labels:
+        terms = category_terms.get(code, [])
+        if terms:
+            deduped = list(dict.fromkeys(t.lower().strip() for t in terms if t.strip()))
+            deduped_sorted = sorted(deduped, key=lambda t: (len(t.split()), len(t)))
+            lines.append(f"- {code}: {', '.join(deduped_sorted[:max_keywords])}")
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     category_labels: List[str],
     category_terms:  Dict[str, List[str]],
     max_keywords:    int = 5,
+    prompt_file:     str = "",
 ) -> str:
     """
-    Builds the system prompt aligned with Mistral official prompting best practices:
+    Builds the system prompt.
 
-    Fix 1 — Markdown headers replace -- SECTION -- plain text.
-             Markdown is explicitly recommended by docs as familiar to the model
-             from training, readable, and parsable.
+    When prompt_file is set, loads the template from disk and fills two placeholders:
+      {{ALLOWED_CATEGORIES}}  — "- Category Name" lines (one per category)
+      {{KEYWORD_HINTS}}       — "- Category: kw1, kw2, ..." lines (from KB)
 
-    Fix 2 — Decision tree replaces numbered steps with potential contradictions.
-             Docs recommend if/otherwise branching to eliminate ambiguity.
-
-    Fix 3 — "Strongest alignment" replaced with explicit tie-breaking rules.
-             Docs say to avoid blurry words like "strongest", "better", "most".
-
-    Fix 4 — Two few-shot examples added.
-             Docs explicitly recommend examples to improve output format compliance,
-             calling it the most effective tool for consistent JSON structure.
-             Examples are placed AFTER the rules so the model sees the format
-             instruction first, then sees it demonstrated.
+    When prompt_file is empty (default), uses the built-in hardcoded prompt.
     """
+    if prompt_file:
+        with open(prompt_file, encoding="utf-8") as fh:
+            template = fh.read()
+        return template.replace(
+            "{{ALLOWED_CATEGORIES}}", _render_allowed_categories(category_labels)
+        ).replace(
+            "{{KEYWORD_HINTS}}", _render_keyword_hints(category_labels, category_terms, max_keywords)
+        ).strip()
+
+    # ---- Built-in hardcoded prompt (backward compatible) ----
 
     # Fix 1: Markdown header for output format block
     output_block = textwrap.dedent("""
@@ -386,25 +429,15 @@ def build_system_prompt(
     """).strip()
 
     # Fix 1: Markdown header for allowed categories
-    allowed_block = "# Allowed Categories\n" + "\n".join(
-        f"- {c}" for c in category_labels
-    )
+    allowed_block = "# Allowed Categories\n" + _render_allowed_categories(category_labels)
 
     # Fix 1: Markdown header for hints (compact format preserved for token efficiency)
-    compact_hints = []
-    for code in category_labels:
-        terms = category_terms.get(code, [])
-        if terms:
-            deduped = list(dict.fromkeys(t.lower().strip() for t in terms if t.strip()))
-            deduped_sorted = sorted(deduped, key=lambda t: (len(t.split()), len(t)))
-            compact_hints.append(f"- {code}: {', '.join(deduped_sorted[:max_keywords])}")
-
     hints_block = (
         "# Keyword Hints\n"
         "Use these to identify likely categories.\n"
         "IMPORTANT: Billing & Payments keywords are MANDATORY triggers — when present,\n"
         "they override all other categories (see Classification Decision Tree below).\n"
-        + "\n".join(compact_hints)
+        + _render_keyword_hints(category_labels, category_terms, max_keywords)
     )
 
     # Fix 2 + 3: Decision tree — billing priority moved to TOP (root cause fix).
@@ -1000,6 +1033,70 @@ def write_parquet(df: pd.DataFrame, path: str) -> None:
 
 
 # --------------------------------------------------
+# SQL HELPERS
+# --------------------------------------------------
+
+def _build_sql_engine(cfg: "Config"):
+    """Build a SQLAlchemy engine from cfg SQL fields (+ .env for credentials)."""
+    import urllib.parse
+    from sqlalchemy import create_engine
+    if cfg.sql_trusted:
+        params = urllib.parse.quote_plus(
+            "DRIVER={ODBC Driver 17 for SQL Server};"
+            f"SERVER={cfg.sql_server};DATABASE={cfg.sql_database};"
+            "Trusted_Connection=yes;"
+        )
+    else:
+        uid = os.environ.get("SQL_UID", "")
+        pwd = os.environ.get("SQL_PWD", "")
+        params = urllib.parse.quote_plus(
+            "DRIVER={ODBC Driver 17 for SQL Server};"
+            f"SERVER={cfg.sql_server};DATABASE={cfg.sql_database};"
+            f"UID={uid};PWD={pwd};"
+        )
+    return create_engine(
+        f"mssql+pyodbc:///?odbc_connect={params}",
+        fast_executemany=True,
+    )
+
+
+def read_from_sql(cfg: "Config", log: logging.Logger) -> pd.DataFrame:
+    """Fetch unclassified emails from SQL Server (Predicted IS NULL/empty, up to sql_batch rows)."""
+    from sqlalchemy import text
+    engine = _build_sql_engine(cfg)
+    # TOP N cannot be parameterised in T-SQL; sql_batch is a validated int from cfg
+    query = text(
+        f"SELECT TOP {int(cfg.sql_batch)} GUID, Subject, Body "
+        f"FROM {cfg.sql_table} "
+        f"WHERE Predicted IS NULL OR Predicted = '' "
+        f"ORDER BY Date ASC"
+    )
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn)
+    log.info("sql_input_loaded", extra={"rows_in": len(df), "sql_table": cfg.sql_table})
+    return df
+
+
+def write_to_sql(df: pd.DataFrame, cfg: "Config", log: logging.Logger) -> None:
+    """Write predictions back to SQL Server row-by-row. Skipped when sql_dry_run=True."""
+    if cfg.sql_dry_run:
+        log.info("sql_dry_run_skip", extra={"rows": len(df), "sql_table": cfg.sql_table})
+        return
+    from sqlalchemy import text
+    engine = _build_sql_engine(cfg)
+    out_col = cfg.out_col
+    stmt = text(
+        f"UPDATE {cfg.sql_table} "
+        f"SET Predicted = :pred, PredictedDate = GETDATE() "
+        f"WHERE GUID = :guid"
+    )
+    with engine.begin() as conn:
+        for _, row in df.iterrows():
+            conn.execute(stmt, {"pred": row[out_col], "guid": row["GUID"]})
+    log.info("sql_output_written", extra={"rows": len(df), "sql_table": cfg.sql_table})
+
+
+# --------------------------------------------------
 # DATA INTEGRITY CHECKER
 # --------------------------------------------------
 
@@ -1109,8 +1206,13 @@ def run(cfg: Config) -> None:
 
     # KB + prompt
     valid_labels, category_terms = load_reduced_kb(cfg.kb_file, log)
-    system_prompt = build_system_prompt(valid_labels, category_terms, cfg.max_keywords)
-    log.info("system_prompt_built", extra={"prompt_chars": len(system_prompt)})
+    system_prompt = build_system_prompt(
+        valid_labels, category_terms, cfg.max_keywords, cfg.prompt_file
+    )
+    log.info("system_prompt_built", extra={
+        "prompt_chars": len(system_prompt),
+        "prompt_file":  cfg.prompt_file or "<built-in>",
+    })
     if cfg.log_prompts or cfg.run_mode in ("dev", "test"):
         log_prompt("system", system_prompt, cfg, log)
 
@@ -1128,23 +1230,33 @@ def run(cfg: Config) -> None:
     )
 
     # Input
-    df = read_parquet(cfg.parquet_in)
+    if cfg.data_source == "sql":
+        df = read_from_sql(cfg, log)
+        _file_in = f"sql://{cfg.sql_server}/{cfg.sql_database}/{cfg.sql_table}"
+    else:
+        df = read_parquet(cfg.parquet_in)
+        _file_in = cfg.parquet_in
     missing = [c for c in ("GUID", "Subject", "Body") if c not in df.columns]
     if missing:
-        raise ValueError(f"Input parquet missing required columns: {missing}")
+        raise ValueError(f"Input missing required columns: {missing}")
 
     rows_in = len(df)
-    log.info("input_loaded", extra={"file_in": cfg.parquet_in, "rows_in": rows_in})
+    log.info("input_loaded", extra={"file_in": _file_in, "rows_in": rows_in})
 
     # Output path
-    parquet_out = cfg.parquet_out
-    if not parquet_out:
-        stem = os.path.splitext(os.path.basename(cfg.parquet_in))[0]
-        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        parquet_out = os.path.join(
-            os.path.dirname(cfg.parquet_in),
-            f"{stem}_with_llm_predictions_{ts}.parquet",
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if cfg.data_source == "sql":
+        parquet_out = cfg.parquet_out or os.path.join(
+            "output", f"sql_{cfg.sql_table}_{ts}.parquet"
         )
+    else:
+        parquet_out = cfg.parquet_out
+        if not parquet_out:
+            stem = os.path.splitext(os.path.basename(cfg.parquet_in))[0]
+            parquet_out = os.path.join(
+                os.path.dirname(cfg.parquet_in),
+                f"{stem}_with_llm_predictions_{ts}.parquet",
+            )
 
     # Telemetry dirs
     records_base = cfg.record_dir or os.path.join(
@@ -1256,7 +1368,7 @@ def run(cfg: Config) -> None:
                 "processing_status": processing_status,
                 "llm_called":        llm_called,
                 "confidence":        prompt_info.get("confidence", "unknown"),
-                "file_in":           cfg.parquet_in,
+                "file_in":           _file_in,
                 "model":             os.path.basename(cfg.model_path),
                 "model_ctx":         cfg.n_ctx,
                 "max_tokens":        cfg.max_tokens,
@@ -1281,7 +1393,7 @@ def run(cfg: Config) -> None:
                     parse_status=parse_stat,
                     processing_status=processing_status,
                     llm_called=llm_called,
-                    latency_ms=latency_ms,        parquet_in=cfg.parquet_in,
+                    latency_ms=latency_ms,        parquet_in=_file_in,
                     prompt_tokens=prompt_info["prompt_tokens"],
                     completion_tokens=prompt_info["completion_tokens"],
                     total_tokens=prompt_info["total_tokens"],
@@ -1328,6 +1440,8 @@ def run(cfg: Config) -> None:
     df["Error_Detail"]        = error_details          # populated only on exceptions
 
     write_parquet(df, parquet_out)
+    if cfg.data_source == "sql":
+        write_to_sql(df, cfg, log)
 
     log.info(
         "output_written",
@@ -1338,7 +1452,7 @@ def run(cfg: Config) -> None:
     )
 
     write_manifest(
-        parquet_in=cfg.parquet_in,
+        parquet_in=_file_in,
         parquet_out=parquet_out,
         log_file=cfg.log_file,
         predictions=predictions,
@@ -1352,7 +1466,7 @@ def run(cfg: Config) -> None:
         extra={
             "rows_total":      len(df),
             "duration_s":      round(time.time() - t_run_start, 3),
-            "file_in":         cfg.parquet_in,
+            "file_in":         _file_in,
             "file_out":        parquet_out,
             "integrity_passed": integrity_report["passed"],
         },
@@ -1376,8 +1490,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     req = p.add_argument_group("Required")
-    req.add_argument("--in",    dest="parquet_in", required=True,
-                     help="Input Parquet file (must contain GUID, Subject, Body).")
+    req.add_argument("--in",    dest="parquet_in", default="",
+                     help="Input Parquet file (must contain GUID, Subject, Body). Not needed when data_source=sql.")
     req.add_argument("--model", dest="model_path", required=True,
                      help="Path to GGUF model file.")
     req.add_argument("--kb",    dest="kb_file",    required=True,
@@ -1436,9 +1550,8 @@ def main() -> None:
 
     log_file = args.log_file
     if not log_file:
-        logs_dir = os.path.join(
-            os.path.dirname(args.parquet_out or args.parquet_in), "logs"
-        )
+        _ref_path = args.parquet_out or args.parquet_in or "."
+        logs_dir = os.path.join(os.path.dirname(_ref_path) or "logs", "logs")
         ensure_dir(logs_dir)
         log_file = os.path.join(
             logs_dir,
