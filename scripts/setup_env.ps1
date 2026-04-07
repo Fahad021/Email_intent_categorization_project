@@ -4,11 +4,15 @@
 # USAGE (right-click this file -> "Run with PowerShell", OR from a terminal):
 #   powershell.exe -ExecutionPolicy Bypass -File scripts\setup_env.ps1
 #
+# Supports two install modes (auto-detected):
+#   CONDA MODE  -- preferred. Uses conda-forge pre-built llama-cpp-python binary.
+#   VENV MODE   -- fallback when conda is absent. Uses Python venv + PyPI wheels.
+#
 # What this script does:
-#   1. Finds (or asks you to install) conda / Miniconda
-#   2. Creates the 'email_intent' conda environment
-#   3. Installs llama-cpp-python from conda-forge (pre-built, no C++ compiler needed)
-#   4. Installs all other Python packages
+#   1. Detects conda or Python (>= 3.10) on the system
+#   2. Creates the environment  (conda env  -OR-  .venv/ in the project root)
+#   3. Installs llama-cpp-python
+#   4. Installs all other Python packages from requirements.txt
 #   5. Creates required folders  (data/, models/, output/, logs/, prompts/)
 #   6. Copies config.example.yaml -> config.yaml  (if config.yaml does not exist)
 #   7. Runs the verification script to confirm everything is correct
@@ -24,15 +28,15 @@ $ErrorActionPreference = "Stop"
 
 function Write-Banner($msg) {
     Write-Host ""
-    Write-Host ("=" * 56)
+    Write-Host ("=" * 60)
     Write-Host "  $msg"
-    Write-Host ("=" * 56)
+    Write-Host ("=" * 60)
 }
 
 function Write-Step($n, $msg) {
     Write-Host ""
     Write-Host "  STEP $n : $msg" -ForegroundColor Cyan
-    Write-Host ("  " + ("-" * 50))
+    Write-Host ("  " + ("-" * 52))
 }
 
 function Write-Pass($msg) { Write-Host "    [PASS] $msg" -ForegroundColor Green  }
@@ -46,33 +50,29 @@ function Pause-AndExit($code) {
     exit $code
 }
 
-# ── Project root (two levels above this script) ───────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-$Root    = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$EnvName = "email_intent"
-$PyVer   = "3.11"
-$LlamaPkg = "llama-cpp-python=0.3.16"
-
-$OtherPackages = @(
-    "pandas>=1.5.0",
-    "openpyxl>=3.0.0",
-    "pyodbc>=4.0.0",
-    "sqlalchemy>=2.0.0",
-    "tqdm>=4.60.0",
-    "python-dotenv>=1.0.0",
-    "pyyaml>=6.0",
-    "pyarrow>=14.0.0"
-)
+$Root        = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$EnvName     = "email_intent"
+$PyVerMajor  = 3
+$PyVerMinor  = 10
+$LlamaPipPkg = "llama-cpp-python==0.3.16"
+$LlamaCondaPkg = "llama-cpp-python=0.3.16"
+$VenvDir     = Join-Path $Root ".venv"
 
 Write-Banner "Email Intent Classifier -- First-Time Setup"
 Write-Info "Project folder: $Root"
 
-# ── STEP 1 : Find conda ───────────────────────────────────────────────────────
+# ── STEP 1 : Detect conda or Python ──────────────────────────────────────────
 
-Write-Step 1 "Finding conda"
+Write-Step 1 "Detecting environment manager (conda or Python venv)"
 
-$CondaExe = $null
-$SearchPaths = @(
+$CondaExe  = $null
+$UseVenv   = $false
+$PythonExe = $null
+
+# Search for conda
+$CondaSearchPaths = @(
     "$env:USERPROFILE\anaconda3\Scripts\conda.exe",
     "$env:USERPROFILE\miniconda3\Scripts\conda.exe",
     "$env:LOCALAPPDATA\conda\conda\Scripts\conda.exe",
@@ -84,78 +84,148 @@ $SearchPaths = @(
 if (Get-Command conda -ErrorAction SilentlyContinue) {
     $CondaExe = "conda"
 } else {
-    foreach ($p in $SearchPaths) {
+    foreach ($p in $CondaSearchPaths) {
         if (Test-Path $p) { $CondaExe = $p; break }
     }
 }
 
-if (-not $CondaExe) {
-    Write-Fail "Conda was not found on this machine."
-    Write-Host ""
-    Write-Host "  Conda (Miniconda) is required to run this project."
-    Write-Host "  It is free, lightweight, and takes about 5 minutes to install."
-    Write-Host ""
-    Write-Host "  Download Miniconda here:"
-    Write-Host "    https://docs.conda.io/en/latest/miniconda.html"
-    Write-Host ""
-    Write-Host "  After installing, close and reopen this window, then run this script again."
-    Pause-AndExit 1
-}
-
-Write-Pass "Found conda: $CondaExe"
-
-# ── STEP 2 : Create conda environment ─────────────────────────────────────────
-
-Write-Step 2 "Setting up conda environment '$EnvName' (Python $PyVer)"
-
-$EnvList  = & $CondaExe env list 2>&1
-$EnvExists = ($EnvList | Select-String -SimpleMatch $EnvName).Count -gt 0
-
-if ($EnvExists) {
-    Write-Pass "Environment '$EnvName' already exists -- skipping creation."
+if ($CondaExe) {
+    Write-Pass "Found conda: $CondaExe  --> using CONDA mode"
 } else {
-    Write-Info "Creating environment (this takes about 1-2 minutes) ..."
-    & $CondaExe create -n $EnvName python=$PyVer -y
-    if ($LASTEXITCODE -ne 0) {
-        Write-Fail "Failed to create conda environment."
+    Write-Note "Conda not found -- checking for Python >= $PyVerMajor.$PyVerMinor ..."
+
+    # Search for a Python 3.10+ executable
+    $PySearchNames = @("python3.11", "python3.10", "python3", "python")
+    foreach ($name in $PySearchNames) {
+        $found = Get-Command $name -ErrorAction SilentlyContinue
+        if ($found) {
+            $ver = & $found.Source --version 2>&1
+            if ($ver -match "Python (\d+)\.(\d+)") {
+                $maj = [int]$Matches[1]; $min = [int]$Matches[2]
+                if ($maj -gt $PyVerMajor -or ($maj -eq $PyVerMajor -and $min -ge $PyVerMinor)) {
+                    $PythonExe = $found.Source
+                    Write-Pass "Found $($found.Name) $ver  --> using VENV mode"
+                    $UseVenv = $true
+                    break
+                }
+            }
+        }
+    }
+
+    if (-not $UseVenv) {
+        Write-Fail "Neither conda nor Python >= $PyVerMajor.$PyVerMinor was found."
         Write-Host ""
-        Write-Host "  Try running this command manually and check for errors:"
-        Write-Host "    conda create -n $EnvName python=$PyVer -y"
+        Write-Host "  You need ONE of the following:"
+        Write-Host ""
+        Write-Host "  OPTION A -- Install Miniconda (recommended):"
+        Write-Host "    https://docs.conda.io/en/latest/miniconda.html"
+        Write-Host ""
+        Write-Host "  OPTION B -- Install Python 3.11 directly:"
+        Write-Host "    https://www.python.org/downloads/"
+        Write-Host "    (tick 'Add Python to PATH' during installation)"
+        Write-Host ""
+        Write-Host "  After installing, re-run this script."
         Pause-AndExit 1
     }
-    Write-Pass "Environment '$EnvName' created."
 }
 
-# ── STEP 3 : Install llama-cpp-python from conda-forge ────────────────────────
-#
-# IMPORTANT: llama-cpp-python must be installed via conda-forge, not pip.
-# The conda-forge build is a pre-compiled binary -- no C++ compiler is needed.
-# Installing via pip would try to compile from source and fail on most machines.
+# ── STEP 2 : Create the environment ──────────────────────────────────────────
 
-Write-Step 3 "Installing llama-cpp-python (pre-built binary from conda-forge)"
+if ($UseVenv) {
+    Write-Step 2 "Creating Python virtual environment  (.venv)"
+
+    if (Test-Path $VenvDir) {
+        Write-Pass ".venv already exists -- skipping creation."
+    } else {
+        Write-Info "Running: python -m venv .venv"
+        & $PythonExe -m venv $VenvDir
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "Failed to create virtual environment."
+            Write-Host "  Try manually: python -m venv .venv"
+            Pause-AndExit 1
+        }
+        Write-Pass ".venv created."
+    }
+
+    # Point PythonExe at the venv Python from here on
+    $PythonExe = Join-Path $VenvDir "Scripts\python.exe"
+
+} else {
+    Write-Step 2 "Setting up conda environment '$EnvName'"
+
+    $EnvList   = & $CondaExe env list 2>&1
+    $EnvExists = ($EnvList | Select-String -SimpleMatch $EnvName).Count -gt 0
+
+    if ($EnvExists) {
+        Write-Pass "Environment '$EnvName' already exists -- skipping creation."
+    } else {
+        Write-Info "Creating environment (this takes 1-2 minutes) ..."
+        & $CondaExe create -n $EnvName python=3.11 -y
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "Failed to create conda environment."
+            Write-Host "  Try: conda create -n $EnvName python=3.11 -y"
+            Pause-AndExit 1
+        }
+        Write-Pass "Environment '$EnvName' created."
+    }
+    # Resolve the conda python path for later steps
+    $PythonExe = (& $CondaExe run -n $EnvName python -c "import sys; print(sys.executable)" 2>&1).Trim()
+}
+
+# ── STEP 3 : Install llama-cpp-python ────────────────────────────────────────
+#
+# Both modes use a pre-built binary wheel:
+#   CONDA : conda-forge  (most reliable on Windows)
+#   VENV  : PyPI wheel   (no C++ compiler required -- pip fetches the .whl)
+
+Write-Step 3 "Installing llama-cpp-python (pre-built binary)"
 Write-Info "This may take 3-5 minutes on first install ..."
 
-& $CondaExe install -n $EnvName -c conda-forge $LlamaPkg -y
-if ($LASTEXITCODE -ne 0) {
-    Write-Fail "Failed to install llama-cpp-python."
-    Write-Host ""
-    Write-Host "  Try running this command manually:"
-    Write-Host "    conda install -n $EnvName -c conda-forge $LlamaPkg -y"
-    Pause-AndExit 1
+if ($UseVenv) {
+    & $PythonExe -m pip install --upgrade pip -q
+    & $PythonExe -m pip install $LlamaPipPkg
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "pip install $LlamaPipPkg failed."
+        Write-Host ""
+        Write-Host "  If the error mentions 'no matching distribution', your Python"
+        Write-Host "  version may not have a pre-built wheel.  Try Python 3.11:"
+        Write-Host "    https://www.python.org/downloads/release/python-3110/"
+        Pause-AndExit 1
+    }
+} else {
+    & $CondaExe install -n $EnvName -c conda-forge $LlamaCondaPkg -y
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "conda install $LlamaCondaPkg failed."
+        Write-Host "  Try: conda install -n $EnvName -c conda-forge $LlamaCondaPkg -y"
+        Pause-AndExit 1
+    }
 }
 Write-Pass "llama-cpp-python installed."
 
-# ── STEP 4 : Install remaining packages via pip ───────────────────────────────
+# ── STEP 4 : Install remaining packages ──────────────────────────────────────
 
 Write-Step 4 "Installing remaining Python packages"
 
-& $CondaExe run -n $EnvName pip install @OtherPackages
+$ReqFile = Join-Path $Root "requirements.txt"
+
+if ($UseVenv) {
+    & $PythonExe -m pip install -r $ReqFile
+} else {
+    & $CondaExe run -n $EnvName pip install -r $ReqFile
+}
+
 if ($LASTEXITCODE -ne 0) {
-    Write-Fail "pip install failed."
+    Write-Fail "Package installation failed."
     Write-Host ""
-    Write-Host "  Try running these commands manually:"
-    Write-Host "    conda activate $EnvName"
-    Write-Host "    pip install -r requirements.txt"
+    if ($UseVenv) {
+        Write-Host "  Try manually:"
+        Write-Host "    .venv\Scripts\activate"
+        Write-Host "    pip install -r requirements.txt"
+    } else {
+        Write-Host "  Try manually:"
+        Write-Host "    conda activate $EnvName"
+        Write-Host "    pip install -r requirements.txt"
+    }
     Pause-AndExit 1
 }
 Write-Pass "All packages installed."
@@ -164,8 +234,7 @@ Write-Pass "All packages installed."
 
 Write-Step 5 "Creating required folders"
 
-$Folders = @("data", "models", "output", "logs", "prompts")
-foreach ($f in $Folders) {
+foreach ($f in @("data", "models", "output", "logs", "prompts")) {
     $p = Join-Path $Root $f
     if (Test-Path $p) {
         Write-Info "$f\ already exists -- skipped."
@@ -194,17 +263,15 @@ if (Test-Path $ConfigPath) {
     Write-Note "  kb_file:    data\your-knowledge-base.xlsx"
 } else {
     Write-Fail "config.example.yaml not found -- cannot create config.yaml."
-    Write-Host "  Please contact the project maintainer or re-clone the repository."
+    Write-Host "  Please re-clone the repository and try again."
 }
 
 # ── STEP 7 : Run verify_env.py ────────────────────────────────────────────────
 
 Write-Step 7 "Running environment verification"
-
-$PythonExe = & $CondaExe run -n $EnvName python -c "import sys; print(sys.executable)" 2>&1
 Write-Info "Python: $PythonExe"
 
-& $CondaExe run -n $EnvName python "$Root\scripts\verify_env.py"
+& $PythonExe "$Root\scripts\verify_env.py"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 
@@ -221,9 +288,14 @@ Write-Host "         $Root\data\"
 Write-Host ""
 Write-Host "    3. Open config.yaml and set model_path and kb_file."
 Write-Host ""
-Write-Host "    4. Run the classifier:"
-Write-Host "         conda activate $EnvName"
-Write-Host "         python claude.py --config config.yaml --kb data\your_kb.xlsx ..."
+Write-Host "    4. Activate your environment and run the classifier:"
+Write-Host ""
+if ($UseVenv) {
+    Write-Host "         .venv\Scripts\activate" -ForegroundColor White
+} else {
+    Write-Host "         conda activate $EnvName" -ForegroundColor White
+}
+Write-Host "         python claude.py --config config.yaml" -ForegroundColor White
 Write-Host ""
 
 Pause-AndExit 0
