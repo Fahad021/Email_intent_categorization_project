@@ -1186,6 +1186,161 @@ def build_integrity_report(
 
 
 # --------------------------------------------------
+# PIPELINE HELPERS
+# --------------------------------------------------
+
+def _resolve_output_path(cfg: Config, ts: str) -> str:
+    """Determine the output parquet path from config and a timestamp string."""
+    if cfg.data_source == "sql":
+        return cfg.parquet_out or os.path.join(
+            "output", f"sql_{cfg.sql_table}_{ts}.parquet"
+        )
+    if cfg.parquet_out:
+        return cfg.parquet_out
+    stem = os.path.splitext(os.path.basename(cfg.parquet_in))[0]
+    return os.path.join(
+        os.path.dirname(cfg.parquet_in),
+        f"{stem}_with_llm_predictions_{ts}.parquet",
+    )
+
+
+def _classify_row(
+    idx:           int,
+    guid:          str,
+    subject:       str,
+    body:          str,
+    model:         Llama,
+    system_prompt: str,
+    valid_labels:  List[str],
+    cfg:           Config,
+    log:           logging.Logger,
+) -> Dict:
+    """
+    Classify a single email row through the LLM and return a result dict.
+
+    Three paths:
+      PATH A - empty input (subject + body blank): skip LLM, status = skipped_empty
+      PATH B - normal: call LLM, parse response
+      PATH C - exception during inference: status = error, llm_called = True
+
+    Returned dict keys:
+      label, raw, parse_stat, processing_status,
+      llm_called, error_detail, prompt_info, latency_ms
+    """
+    t0 = time.time()
+    _empty_prompt: Dict = {
+        "system_prompt":     system_prompt,
+        "user_prompt":       "",
+        "prompt_tokens":     0,
+        "completion_tokens": 0,
+        "total_tokens":      0,
+        "confidence":        "low",
+        "all_intents":       [],
+    }
+
+    # PATH A: empty input — skip LLM
+    if not subject and not body:
+        return {
+            "label":             "Unclassified",
+            "raw":               "",
+            "parse_stat":        STATUS_SKIPPED_EMPTY,
+            "processing_status": STATUS_SKIPPED_EMPTY,
+            "llm_called":        False,
+            "error_detail":      "",
+            "prompt_info":       _empty_prompt,
+            "latency_ms":        int((time.time() - t0) * 1000),
+        }
+
+    # PATH B: normal — call LLM
+    try:
+        label, raw, parse_stat, prompt_info = predict_intent(
+            model=model, system_prompt=system_prompt,
+            subject=subject, body=body,
+            valid_labels=valid_labels, cfg=cfg, log=log,
+        )
+        return {
+            "label":             label,
+            "raw":               raw,
+            "parse_stat":        parse_stat,
+            "processing_status": parse_stat,
+            "llm_called":        True,
+            "error_detail":      "",
+            "prompt_info":       prompt_info,
+            "latency_ms":        int((time.time() - t0) * 1000),
+        }
+
+    # PATH C: exception during inference — LLM was attempted
+    except Exception as e:
+        error_detail = str(e)
+        log.error("inference_error", extra={"guid": guid, "row_index": idx, "error": error_detail})
+        return {
+            "label":             "Unclassified",
+            "raw":               "",
+            "parse_stat":        STATUS_ERROR,
+            "processing_status": STATUS_ERROR,
+            "llm_called":        True,
+            "error_detail":      error_detail,
+            "prompt_info":       _empty_prompt,
+            "latency_ms":        int((time.time() - t0) * 1000),
+        }
+
+
+def _write_row_records(
+    result:       Dict,
+    idx:          int,
+    guid:         str,
+    subject:      str,
+    body:         str,
+    records_base: str,
+    prompts_dir:  str,
+    file_in:      str,
+    budget:       PromptBudget,
+    cfg:          Config,
+    log:          logging.Logger,
+) -> None:
+    """Write per-row inference and prompt telemetry records. Silently logs on failure."""
+    prompt_info = result["prompt_info"]
+    try:
+        write_inference_record(
+            out_dir=records_base,
+            guid=guid,
+            row_index=idx,
+            subject=subject,
+            body=body,
+            user_prompt=prompt_info["user_prompt"],
+            system_prompt=prompt_info["system_prompt"],
+            raw_response=result["raw"],
+            label=result["label"],
+            parse_status=result["parse_stat"],
+            processing_status=result["processing_status"],
+            llm_called=result["llm_called"],
+            latency_ms=result["latency_ms"],
+            parquet_in=file_in,
+            prompt_tokens=prompt_info["prompt_tokens"],
+            completion_tokens=prompt_info["completion_tokens"],
+            total_tokens=prompt_info["total_tokens"],
+            confidence=prompt_info.get("confidence", "unknown"),
+            all_intents=prompt_info.get("all_intents", []),
+            body_budget=budget.body_char_limit,
+            cfg=cfg,
+        )
+        if result["llm_called"]:
+            write_prompt_record(
+                out_dir=prompts_dir,
+                row_index=idx,
+                guid=guid,
+                system_prompt=prompt_info["system_prompt"],
+                user_prompt=prompt_info["user_prompt"],
+                prompt_tokens=prompt_info["prompt_tokens"],
+                completion_tokens=prompt_info["completion_tokens"],
+                total_tokens=prompt_info["total_tokens"],
+                cfg=cfg,
+            )
+    except Exception as e:
+        log.warning("record_write_failed", extra={"guid": guid, "row_index": idx, "msg": str(e)})
+
+
+# --------------------------------------------------
 # MAIN PIPELINE
 # --------------------------------------------------
 
@@ -1244,19 +1399,8 @@ def run(cfg: Config) -> None:
     log.info("input_loaded", extra={"file_in": _file_in, "rows_in": rows_in})
 
     # Output path
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if cfg.data_source == "sql":
-        parquet_out = cfg.parquet_out or os.path.join(
-            "output", f"sql_{cfg.sql_table}_{ts}.parquet"
-        )
-    else:
-        parquet_out = cfg.parquet_out
-        if not parquet_out:
-            stem = os.path.splitext(os.path.basename(cfg.parquet_in))[0]
-            parquet_out = os.path.join(
-                os.path.dirname(cfg.parquet_in),
-                f"{stem}_with_llm_predictions_{ts}.parquet",
-            )
+    ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+    parquet_out = _resolve_output_path(cfg, ts)
 
     # Telemetry dirs
     records_base = cfg.record_dir or os.path.join(
@@ -1284,89 +1428,33 @@ def run(cfg: Config) -> None:
         body    = str(row.get("Body")    or "")
 
         subject, body = prepare_subject_body(subject, body, budget)
-        t0 = time.time()
 
-        # ---- PATH A: empty input — skip LLM, flag explicitly ----
-        if not subject and not body:
-            label              = "Unclassified"
-            raw                = ""
-            parse_stat         = STATUS_SKIPPED_EMPTY
-            processing_status  = STATUS_SKIPPED_EMPTY
-            llm_called         = False
-            error_detail       = ""
-            prompt_info: Dict  = {
-                "system_prompt":     system_prompt,
-                "user_prompt":       "",
-                "prompt_tokens":     0,
-                "completion_tokens": 0,
-                "total_tokens":      0,
-                "confidence":        "low",
-                "all_intents":       [],
-            }
+        result      = _classify_row(idx, guid, subject, body, model, system_prompt, valid_labels, cfg, log)
+        prompt_info = result["prompt_info"]
 
-        # ---- PATH B: normal — call LLM ----
-        else:
-            llm_called   = True
-            error_detail = ""
-            try:
-                label, raw, parse_stat, prompt_info = predict_intent(
-                    model=model, system_prompt=system_prompt,
-                    subject=subject, body=body,
-                    valid_labels=valid_labels, cfg=cfg, log=log,
-                )
-                # processing_status mirrors parse_stat for successful LLM calls
-                processing_status = parse_stat
-
-            # ---- PATH C: exception — LLM was attempted, store error detail ----
-            except Exception as e:
-                label             = "Unclassified"
-                raw               = ""
-                parse_stat        = STATUS_ERROR
-                processing_status = STATUS_ERROR
-                error_detail      = str(e)
-                prompt_info = {
-                    "system_prompt":     system_prompt,
-                    "user_prompt":       "",
-                    "prompt_tokens":     0,
-                    "completion_tokens": 0,
-                    "total_tokens":      0,
-                    "confidence":        "low",
-                    "all_intents":       [],
-                }
-                log.error(
-                    "inference_error",
-                    extra={
-                        "guid":       guid,
-                        "row_index":  idx,
-                        "error":      error_detail,
-                    },
-                )
-
-        latency_ms = int((time.time() - t0) * 1000)
-
-        predictions.append(label)
-        parse_statuses.append(parse_stat)
-        processing_statuses.append(processing_status)
-        llm_called_flags.append(llm_called)
+        predictions.append(result["label"])
+        parse_statuses.append(result["parse_stat"])
+        processing_statuses.append(result["processing_status"])
+        llm_called_flags.append(result["llm_called"])
         confidences.append(prompt_info.get("confidence", "unknown"))
         all_intents_col.append(json.dumps(prompt_info.get("all_intents", [])))
-        error_details.append(error_detail)
+        error_details.append(result["error_detail"])
 
         log.info(
             "inference_done",
             extra={
                 "guid":              guid,
                 "row_index":         idx,
-                "latency_ms":        latency_ms,
-                "intent_code":       label,
-                "intent":            label,
+                "latency_ms":        result["latency_ms"],
+                "intent_code":       result["label"],
+                "intent":            result["label"],
                 "subject_len":       len(subject),
                 "body_len":          len(body),
                 "body_budget":       budget.body_char_limit,
-                "response_raw":      redact(raw, enabled=cfg.redact_logs, max_chars=500),
-                "parse_status":      parse_stat,
-                "processing_status": processing_status,
-                "llm_called":        llm_called,
+                "response_raw":      redact(result["raw"], enabled=cfg.redact_logs, max_chars=500),
+                "parse_status":      result["parse_stat"],
+                "processing_status": result["processing_status"],
+                "llm_called":        result["llm_called"],
                 "confidence":        prompt_info.get("confidence", "unknown"),
                 "file_in":           _file_in,
                 "model":             os.path.basename(cfg.model_path),
@@ -1382,42 +1470,7 @@ def run(cfg: Config) -> None:
         )
 
         if not cfg.no_records:
-            try:
-                write_inference_record(
-                    out_dir=records_base,         guid=guid,
-                    row_index=idx,                subject=subject,
-                    body=body,
-                    user_prompt=prompt_info["user_prompt"],
-                    system_prompt=prompt_info["system_prompt"],
-                    raw_response=raw,             label=label,
-                    parse_status=parse_stat,
-                    processing_status=processing_status,
-                    llm_called=llm_called,
-                    latency_ms=latency_ms,        parquet_in=_file_in,
-                    prompt_tokens=prompt_info["prompt_tokens"],
-                    completion_tokens=prompt_info["completion_tokens"],
-                    total_tokens=prompt_info["total_tokens"],
-                    confidence=prompt_info.get("confidence", "unknown"),
-                    all_intents=prompt_info.get("all_intents", []),
-                    body_budget=budget.body_char_limit,
-                    cfg=cfg,
-                )
-                if llm_called:
-                    write_prompt_record(
-                        out_dir=prompts_dir,      row_index=idx,
-                        guid=guid,
-                        system_prompt=prompt_info["system_prompt"],
-                        user_prompt=prompt_info["user_prompt"],
-                        prompt_tokens=prompt_info["prompt_tokens"],
-                        completion_tokens=prompt_info["completion_tokens"],
-                        total_tokens=prompt_info["total_tokens"],
-                        cfg=cfg,
-                    )
-            except Exception as e:
-                log.warning(
-                    "record_write_failed",
-                    extra={"guid": guid, "row_index": idx, "msg": str(e)},
-                )
+            _write_row_records(result, idx, guid, subject, body, records_base, prompts_dir, _file_in, budget, cfg, log)
 
     # ---- DATA INTEGRITY CHECK ----
     integrity_report = build_integrity_report(
