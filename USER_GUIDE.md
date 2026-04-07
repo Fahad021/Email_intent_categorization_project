@@ -59,6 +59,48 @@ creates the environment, installs all packages, creates required folders, and co
 the example config.  It then runs a verification check and tells you if anything is
 missing.
 
+**Using a Python environment you already have**
+
+If you have a Python 3.10+ environment already set up (a venv, a conda env, or any
+Python executable), you can skip environment creation entirely:
+
+```powershell
+# Use an existing venv (relative or absolute path)
+powershell.exe -ExecutionPolicy Bypass -File scripts\setup_env.ps1 `
+    -ExistingPython ".venv\Scripts\python.exe"
+
+# Use an existing conda environment by name
+powershell.exe -ExecutionPolicy Bypass -File scripts\setup_env.ps1 `
+    -ExistingCondaEnv "my_nlp_env"
+```
+
+The script will validate the environment, then proceed from package installation
+onward (skipping env creation).
+
+**Installing llama-cpp-python from a local `.whl` file**
+
+If your machine has no internet access, or a colleague has already downloaded the
+wheel, you can supply it directly.  You can also drop any file matching
+`llama_cpp_python*.whl` into the project root or a `wheels\` subfolder and the
+script will find it automatically.
+
+```powershell
+# Explicit path
+powershell.exe -ExecutionPolicy Bypass -File scripts\setup_env.ps1 `
+    -LlamaWhl "C:\Downloads\llama_cpp_python-0.3.16-cp311-win_amd64.whl"
+
+# Drop the .whl into wheels\ and just run normally — it is picked up automatically
+powershell.exe -ExecutionPolicy Bypass -File scripts\setup_env.ps1
+```
+
+Parameters can be combined:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File scripts\setup_env.ps1 `
+    -ExistingPython ".venv\Scripts\python.exe" `
+    -LlamaWhl "wheels\llama_cpp_python-0.3.16-cp311-win_amd64.whl"
+```
+
 ### Option B — Manual (conda)
 
 ```bash

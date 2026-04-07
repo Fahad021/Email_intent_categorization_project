@@ -4,14 +4,34 @@
 # USAGE (right-click this file -> "Run with PowerShell", OR from a terminal):
 #   powershell.exe -ExecutionPolicy Bypass -File scripts\setup_env.ps1
 #
-# Supports two install modes (auto-detected):
-#   CONDA MODE  -- preferred. Uses conda-forge pre-built llama-cpp-python binary.
-#   VENV MODE   -- fallback when conda is absent. Uses Python venv + PyPI wheels.
+# Optional parameters:
+#   -ExistingPython   "C:\path\to\python.exe"   Use an already-configured Python
+#                                                (any venv, conda env, system Python).
+#                                                Skips environment creation entirely.
+#   -ExistingCondaEnv "env_name"                Use an existing conda environment.
+#                                                Skips environment creation entirely.
+#   -LlamaWhl         "C:\path\to\*.whl"        Install llama-cpp-python from a local
+#                                                .whl file instead of downloading it.
+#
+# Examples:
+#   # Re-use a venv you already have:
+#   powershell.exe -ExecutionPolicy Bypass -File scripts\setup_env.ps1 -ExistingPython ".venv\Scripts\python.exe"
+#
+#   # Re-use a colleague's conda environment:
+#   powershell.exe -ExecutionPolicy Bypass -File scripts\setup_env.ps1 -ExistingCondaEnv "my_nlp_env"
+#
+#   # Install llama-cpp-python from a downloaded .whl (no internet needed):
+#   powershell.exe -ExecutionPolicy Bypass -File scripts\setup_env.ps1 -LlamaWhl "C:\Downloads\llama_cpp_python-0.3.16-cp311-win_amd64.whl"
+#
+# Supports three install modes (auto-detected unless overridden):
+#   CONDA MODE      -- preferred. conda-forge pre-built llama-cpp-python binary.
+#   VENV MODE       -- fallback when conda is absent. Python venv + PyPI wheels.
+#   EXISTING ENV    -- skip env creation; use a Python / conda env you already have.
 #
 # What this script does:
-#   1. Detects conda or Python (>= 3.10) on the system
-#   2. Creates the environment  (conda env  -OR-  .venv/ in the project root)
-#   3. Installs llama-cpp-python
+#   1. Detects conda or Python (>= 3.10)  [skipped when -ExistingPython/-ExistingCondaEnv used]
+#   2. Creates the environment            [skipped when existing env provided]
+#   3. Installs llama-cpp-python          (from -LlamaWhl, wheels\ folder, or network)
 #   4. Installs all other Python packages from requirements.txt
 #   5. Creates required folders  (data/, models/, output/, logs/, prompts/)
 #   6. Copies config.example.yaml -> config.yaml  (if config.yaml does not exist)
@@ -21,6 +41,12 @@
 #   - Copy your .gguf model file into the models\ folder
 #   - Copy your knowledge base .xlsx file into the data\ folder
 #   - Open config.yaml and update model_path and kb_file
+
+param(
+    [string]$ExistingPython   = "",   # path to an existing python.exe
+    [string]$ExistingCondaEnv = "",   # name of an existing conda environment
+    [string]$LlamaWhl         = ""    # path to a local llama_cpp_python .whl file
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -60,6 +86,24 @@ $LlamaPipPkg = "llama-cpp-python==0.3.16"
 $LlamaCondaPkg = "llama-cpp-python=0.3.16"
 $VenvDir     = Join-Path $Root ".venv"
 
+# Resolve a local llama-cpp-python wheel.
+# -LlamaWhl parameter takes priority; otherwise auto-scan project root and wheels\ subfolder.
+if ($LlamaWhl -and -not (Test-Path $LlamaWhl)) {
+    Write-Host "  [FAIL] -LlamaWhl path not found: $LlamaWhl" -ForegroundColor Red
+    exit 1
+}
+if (-not $LlamaWhl) {
+    foreach ($scanDir in @($Root, (Join-Path $Root "wheels"))) {
+        if (Test-Path $scanDir) {
+            $hit = Get-ChildItem -Path $scanDir -Filter "llama_cpp_python*.whl" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { $LlamaWhl = $hit.FullName; break }
+        }
+    }
+    if ($LlamaWhl) {
+        Write-Host "    [INFO] Found local wheel: $LlamaWhl"
+    }
+}
+
 Write-Banner "Email Intent Classifier -- First-Time Setup"
 Write-Info "Project folder: $Root"
 
@@ -67,11 +111,11 @@ Write-Info "Project folder: $Root"
 
 Write-Step 1 "Detecting environment manager (conda or Python venv)"
 
-$CondaExe  = $null
-$UseVenv   = $false
-$PythonExe = $null
+$CondaExe      = $null
+$UseVenv       = $false
+$PythonExe     = $null
+$SkipEnvCreate = $false
 
-# Search for conda
 $CondaSearchPaths = @(
     "$env:USERPROFILE\anaconda3\Scripts\conda.exe",
     "$env:USERPROFILE\miniconda3\Scripts\conda.exe",
@@ -81,57 +125,106 @@ $CondaSearchPaths = @(
     "C:\tools\miniconda3\Scripts\conda.exe"
 )
 
-if (Get-Command conda -ErrorAction SilentlyContinue) {
-    $CondaExe = "conda"
-} else {
-    foreach ($p in $CondaSearchPaths) {
-        if (Test-Path $p) { $CondaExe = $p; break }
+# ---- Existing Python executable supplied via -ExistingPython -----------------
+if ($ExistingPython) {
+    $resolved = if ([System.IO.Path]::IsPathRooted($ExistingPython)) {
+        $ExistingPython
+    } else {
+        Join-Path $Root $ExistingPython
     }
-}
+    if (-not (Test-Path $resolved)) {
+        Write-Fail "-ExistingPython not found: $resolved"
+        Pause-AndExit 1
+    }
+    $PythonExe     = $resolved
+    $UseVenv       = $true
+    $SkipEnvCreate = $true
+    $ver = & $PythonExe --version 2>&1
+    Write-Pass "Using existing Python ($ver): $PythonExe"
 
-if ($CondaExe) {
-    Write-Pass "Found conda: $CondaExe  --> using CONDA mode"
+# ---- Existing conda environment supplied via -ExistingCondaEnv ---------------
+} elseif ($ExistingCondaEnv) {
+    if (Get-Command conda -ErrorAction SilentlyContinue) {
+        $CondaExe = "conda"
+    } else {
+        foreach ($p in $CondaSearchPaths) {
+            if (Test-Path $p) { $CondaExe = $p; break }
+        }
+    }
+    if (-not $CondaExe) {
+        Write-Fail "-ExistingCondaEnv was specified but conda could not be found."
+        Pause-AndExit 1
+    }
+    $envList = & $CondaExe env list 2>&1
+    if (($envList | Select-String -SimpleMatch $ExistingCondaEnv).Count -eq 0) {
+        Write-Fail "Conda environment '$ExistingCondaEnv' does not exist."
+        Write-Host "  Available environments:"
+        $envList | Where-Object { $_ -match "^\S" } | ForEach-Object { Write-Host "    $_" }
+        Pause-AndExit 1
+    }
+    $EnvName       = $ExistingCondaEnv
+    $SkipEnvCreate = $true
+    $PythonExe     = (& $CondaExe run -n $EnvName python -c "import sys; print(sys.executable)" 2>&1).Trim()
+    Write-Pass "Using existing conda environment: $EnvName  ($PythonExe)"
+
+# ---- Auto-detect conda or Python ---------------------------------------------
 } else {
-    Write-Note "Conda not found -- checking for Python >= $PyVerMajor.$PyVerMinor ..."
-
-    # Search for a Python 3.10+ executable
-    $PySearchNames = @("python3.11", "python3.10", "python3", "python")
-    foreach ($name in $PySearchNames) {
-        $found = Get-Command $name -ErrorAction SilentlyContinue
-        if ($found) {
-            $ver = & $found.Source --version 2>&1
-            if ($ver -match "Python (\d+)\.(\d+)") {
-                $maj = [int]$Matches[1]; $min = [int]$Matches[2]
-                if ($maj -gt $PyVerMajor -or ($maj -eq $PyVerMajor -and $min -ge $PyVerMinor)) {
-                    $PythonExe = $found.Source
-                    Write-Pass "Found $($found.Name) $ver  --> using VENV mode"
-                    $UseVenv = $true
-                    break
-                }
-            }
+    if (Get-Command conda -ErrorAction SilentlyContinue) {
+        $CondaExe = "conda"
+    } else {
+        foreach ($p in $CondaSearchPaths) {
+            if (Test-Path $p) { $CondaExe = $p; break }
         }
     }
 
-    if (-not $UseVenv) {
-        Write-Fail "Neither conda nor Python >= $PyVerMajor.$PyVerMinor was found."
-        Write-Host ""
-        Write-Host "  You need ONE of the following:"
-        Write-Host ""
-        Write-Host "  OPTION A -- Install Miniconda (recommended):"
-        Write-Host "    https://docs.conda.io/en/latest/miniconda.html"
-        Write-Host ""
-        Write-Host "  OPTION B -- Install Python 3.11 directly:"
-        Write-Host "    https://www.python.org/downloads/"
-        Write-Host "    (tick 'Add Python to PATH' during installation)"
-        Write-Host ""
-        Write-Host "  After installing, re-run this script."
-        Pause-AndExit 1
+    if ($CondaExe) {
+        Write-Pass "Found conda: $CondaExe  --> using CONDA mode"
+    } else {
+        Write-Note "Conda not found -- checking for Python >= $PyVerMajor.$PyVerMinor ..."
+
+        # Search for a Python 3.10+ executable
+        $PySearchNames = @("python3.11", "python3.10", "python3", "python")
+        foreach ($name in $PySearchNames) {
+            $found = Get-Command $name -ErrorAction SilentlyContinue
+            if ($found) {
+                $ver = & $found.Source --version 2>&1
+                if ($ver -match "Python (\d+)\.(\d+)") {
+                    $maj = [int]$Matches[1]; $min = [int]$Matches[2]
+                    if ($maj -gt $PyVerMajor -or ($maj -eq $PyVerMajor -and $min -ge $PyVerMinor)) {
+                        $PythonExe = $found.Source
+                        Write-Pass "Found $($found.Name) $ver  --> using VENV mode"
+                        $UseVenv = $true
+                        break
+                    }
+                }
+            }
+        }
+
+        if (-not $UseVenv) {
+            Write-Fail "Neither conda nor Python >= $PyVerMajor.$PyVerMinor was found."
+            Write-Host ""
+            Write-Host "  You need ONE of the following:"
+            Write-Host ""
+            Write-Host "  OPTION A -- Install Miniconda (recommended):"
+            Write-Host "    https://docs.conda.io/en/latest/miniconda.html"
+            Write-Host ""
+            Write-Host "  OPTION B -- Install Python 3.11 directly:"
+            Write-Host "    https://www.python.org/downloads/"
+            Write-Host "    (tick 'Add Python to PATH' during installation)"
+            Write-Host ""
+            Write-Host "  After installing, re-run this script."
+            Pause-AndExit 1
+        }
     }
 }
 
 # ── STEP 2 : Create the environment ──────────────────────────────────────────
 
-if ($UseVenv) {
+if ($SkipEnvCreate) {
+    Write-Step 2 "Environment creation"
+    Write-Pass "Skipped -- using existing environment."
+
+} elseif ($UseVenv) {
     Write-Step 2 "Creating Python virtual environment  (.venv)"
 
     if (Test-Path $VenvDir) {
@@ -174,14 +267,34 @@ if ($UseVenv) {
 
 # ── STEP 3 : Install llama-cpp-python ────────────────────────────────────────
 #
-# Both modes use a pre-built binary wheel:
-#   CONDA : conda-forge  (most reliable on Windows)
-#   VENV  : PyPI wheel   (no C++ compiler required -- pip fetches the .whl)
+# Priority order:
+#   1. Local .whl file  (-LlamaWhl param, or auto-found in project root / wheels\)
+#   2. conda-forge      (conda mode, requires network)
+#   3. PyPI wheel       (venv / existing-Python mode, requires network)
+#
+# When re-using an existing environment, install is skipped if llama_cpp already works.
 
-Write-Step 3 "Installing llama-cpp-python (pre-built binary)"
-Write-Info "This may take 3-5 minutes on first install ..."
+Write-Step 3 "Installing llama-cpp-python"
 
-if ($UseVenv) {
+# Check if llama_cpp is already importable (saves time when re-using an existing env)
+$checkResult = & $PythonExe -c "import llama_cpp; print('ok')" 2>&1
+$LlamaAlreadyInstalled = ($checkResult -match "^ok")
+
+if ($LlamaAlreadyInstalled -and -not $LlamaWhl) {
+    Write-Pass "llama-cpp-python is already installed -- skipping."
+
+} elseif ($LlamaWhl) {
+    Write-Info "Installing from local wheel: $LlamaWhl"
+    & $PythonExe -m pip install --upgrade pip -q
+    & $PythonExe -m pip install $LlamaWhl
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "pip install from wheel failed: $LlamaWhl"
+        Pause-AndExit 1
+    }
+    Write-Pass "llama-cpp-python installed from local wheel."
+
+} elseif ($UseVenv -or $SkipEnvCreate) {
+    Write-Info "Downloading from PyPI (this may take 3-5 minutes) ..."
     & $PythonExe -m pip install --upgrade pip -q
     & $PythonExe -m pip install $LlamaPipPkg
     if ($LASTEXITCODE -ne 0) {
@@ -190,17 +303,28 @@ if ($UseVenv) {
         Write-Host "  If the error mentions 'no matching distribution', your Python"
         Write-Host "  version may not have a pre-built wheel.  Try Python 3.11:"
         Write-Host "    https://www.python.org/downloads/release/python-3110/"
+        Write-Host ""
+        Write-Host "  Alternatively, download a pre-built .whl from:"
+        Write-Host "    https://github.com/abetlen/llama-cpp-python/releases"
+        Write-Host "  then re-run with:  -LlamaWhl path\to\file.whl"
         Pause-AndExit 1
     }
+    Write-Pass "llama-cpp-python installed."
+
 } else {
+    Write-Info "Installing from conda-forge (this may take 3-5 minutes) ..."
     & $CondaExe install -n $EnvName -c conda-forge $LlamaCondaPkg -y
     if ($LASTEXITCODE -ne 0) {
         Write-Fail "conda install $LlamaCondaPkg failed."
         Write-Host "  Try: conda install -n $EnvName -c conda-forge $LlamaCondaPkg -y"
+        Write-Host ""
+        Write-Host "  Or download a pre-built .whl from:"
+        Write-Host "    https://github.com/abetlen/llama-cpp-python/releases"
+        Write-Host "  then re-run with:  -LlamaWhl path\to\file.whl"
         Pause-AndExit 1
     }
+    Write-Pass "llama-cpp-python installed."
 }
-Write-Pass "llama-cpp-python installed."
 
 # ── STEP 4 : Install remaining packages ──────────────────────────────────────
 
