@@ -45,20 +45,25 @@ def _head(title: str) -> None:
 
 _failures: list[str] = []
 _warnings: list[str] = []
+_fix_commands: list[str] = []    # copy-paste commands shown at the end
 
 
 def ok(msg: str) -> None:
     print(f"  {PASS}  {msg}")
 
 
-def warn(msg: str) -> None:
+def warn(msg: str, fix: str = "") -> None:
     print(f"  {WARN}  {msg}")
     _warnings.append(msg)
+    if fix:
+        _fix_commands.append(fix)
 
 
-def fail(msg: str) -> None:
+def fail(msg: str, fix: str = "") -> None:
     print(f"  {FAIL}  {msg}")
     _failures.append(msg)
+    if fix:
+        _fix_commands.append(fix)
 
 
 def info(msg: str) -> None:
@@ -108,12 +113,21 @@ def check_packages() -> None:
                 parquet_ok = True
         except ImportError:
             if required:
-                fail(f"{pip_name}  — not installed  (pip install {pip_name})")
+                fail(
+                    f"{pip_name}  — not installed",
+                    fix=f"pip install {pip_name}",
+                )
             else:
-                warn(f"{pip_name}  — not installed (optional)")
+                warn(
+                    f"{pip_name}  — not installed (optional)",
+                    fix=f"pip install {pip_name}  # optional",
+                )
 
     if not parquet_ok:
-        fail("Neither pyarrow nor fastparquet is installed — parquet I/O will not work")
+        fail(
+            "Neither pyarrow nor fastparquet is installed — parquet I/O will not work",
+            fix="pip install pyarrow",
+        )
 
 
 # ── 3. classifier package integrity ───────────────────────────────────────────
@@ -163,7 +177,10 @@ def check_folders(project_root: str) -> None:
         if os.path.isdir(path):
             ok(f"{d}/")
         else:
-            warn(f"{d}/  — missing, will be created on first run  (run: mkdir {d})")
+            warn(
+                f"{d}/  — missing (will be auto-created on first run)",
+                fix=f"mkdir {d}",
+            )
 
 
 # ── 5. Key project files ──────────────────────────────────────────────────────
@@ -192,7 +209,10 @@ def check_project_files(project_root: str) -> None:
     if os.path.isfile(config_path):
         ok("config.yaml")
     else:
-        warn("config.yaml  — not found; copy config.example.yaml  (cp config.example.yaml config.yaml)")
+        warn(
+            "config.yaml  — not found",
+            fix="copy config.example.yaml config.yaml  (then edit model_path and kb_file)",
+        )
 
 
 # ── 6. YAML config validation ─────────────────────────────────────────────────
@@ -315,17 +335,20 @@ def main() -> None:
             print(f"          - {f}")
         if _warnings:
             print(f"  {WARN}  {len(_warnings)} warning(s) — see above for details")
-        print(f"{_BOLD}{'='*54}{_RESET}\n")
-        sys.exit(1)
     elif _warnings:
         print(f"  {PASS}  All required checks passed")
         print(f"  {WARN}  {len(_warnings)} warning(s) — see above for details")
-        print(f"{_BOLD}{'='*54}{_RESET}\n")
-        sys.exit(0)
     else:
         print(f"  {PASS}  All checks passed — environment is ready")
-        print(f"{_BOLD}{'='*54}{_RESET}\n")
-        sys.exit(0)
+
+    if _fix_commands:
+        print(f"")
+        print(f"  {_BOLD}To fix the issues above, run:{_RESET}")
+        for cmd in _fix_commands:
+            print(f"    > {cmd}")
+
+    print(f"{_BOLD}{'='*54}{_RESET}\n")
+    sys.exit(1 if _failures else 0)
 
 
 if __name__ == "__main__":
