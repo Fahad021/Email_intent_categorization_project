@@ -1,0 +1,174 @@
+# ============================================================
+# config.example.yaml  —  Fully documented reference
+# ============================================================
+# Copy this to config.yaml and fill in your actual paths.
+# Never commit real .env secrets to git.
+# ============================================================
+
+# ----------------------------------------------------------
+# Paths
+# ----------------------------------------------------------
+
+# Path to the local GGUF model file.
+# Recommended: mistral-7b-instruct-v0.2.Q4_K_M.gguf (~4.4 GB)
+# Download: https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF
+model_path: models/mistral-7b-instruct-v0.2.Q4_K_M.gguf
+
+# Path to the Knowledgebase Excel file.
+# Required sheet: "Merged_Knowledgebase"
+# Required columns: Reduced_Category, Merged_Terms
+kb_file: data/SPSS_Category_Concepts.xlsx
+
+# Path to the system prompt template.
+# The file uses two placeholders filled at runtime:
+#   {{ALLOWED_CATEGORIES}}  — one "- Category Name" line per category (from KB)
+#   {{KEYWORD_HINTS}}       — one "- Category: kw1, kw2, ..." line per category
+# Set to "" to use the built-in hardcoded prompt (no file needed).
+prompt_file: prompts/system_prompt.txt
+
+# ----------------------------------------------------------
+# Data source
+# ----------------------------------------------------------
+
+# "parquet" — read from a local parquet file (default, good for batch/offline)
+# "sql"     — read from SQL Server and write predictions back to DB
+data_source: parquet
+
+# --- Parquet settings (data_source = parquet) ---
+
+# Input parquet file. Must have columns: GUID, Subject, Body
+parquet_in: data/emails.parquet
+
+# Output parquet path. Auto-named next to parquet_in if blank.
+# Example auto-name: data/emails_with_llm_predictions_20260407_120000.parquet
+parquet_out: ""
+
+# Name of the new prediction column added to the output parquet.
+out_col: Predicted_Reduced_Category
+
+# --- SQL settings (data_source = sql) ---
+# SQL credentials come from .env (SQL_UID / SQL_PWD), not this file.
+
+# SQL Server hostname or IP
+sql_server: GENESYSCICDBQA.corp.hydro.one
+
+# Database name
+sql_database: EMAIL
+
+# Full table reference including schema
+sql_table: "[dbo].[Original_Email]"
+
+# true  = Windows Authentication (Trusted_Connection=yes)
+# false = SQL Server Authentication (reads SQL_UID / SQL_PWD from .env)
+sql_trusted: true
+
+# Number of unclassified emails fetched and processed per run
+sql_batch: 100
+
+# When true: run inference but do NOT write predictions back to SQL.
+# Useful for testing without touching the database.
+sql_dry_run: false
+
+# ----------------------------------------------------------
+# LLM settings
+# ----------------------------------------------------------
+
+# Context window in tokens. Must be >= than your longest email + system prompt.
+# 8192 handles most emails. Increase to 16384 for very long threads.
+n_ctx: 8192
+
+# Number of model layers offloaded to GPU. 0 = CPU only.
+# On a 24 GB VRAM card, all 32 layers can be offloaded for ~10x throughput.
+n_gpu_layers: 0
+
+# Token batch size for prompt processing. 512 is a safe default.
+# Increase to 1024 if you have lots of RAM / VRAM.
+n_batch: 512
+
+# Maximum tokens the model can generate per response.
+# 256 is more than enough for a single JSON object.
+max_tokens: 256
+
+# Sampling temperature. Lower = more deterministic (recommended for classification).
+# 0.0 = greedy. 0.05 = near-greedy. Never use > 0.3 for classification.
+temperature: 0.05
+
+# Nucleus sampling. 0.90 = consider top 90% of probability mass.
+# Tighter than typical creative tasks (0.95) — reduces hallucination.
+top_p: 0.90
+
+# Top-k sampling. 10 = only consider top 10 tokens at each step.
+# Low k increases determinism and improves JSON compliance.
+top_k: 10
+
+# Repetition penalty. 1.1 discourages repeating the same token.
+# Keep between 1.0 (off) and 1.2 for classification tasks.
+repeat_penalty: 1.1
+
+# How many hint keywords to show per category in the system prompt.
+# Higher = more informative prompt but more tokens consumed.
+max_keywords: 5
+
+# ----------------------------------------------------------
+# GGUF best practices
+# ----------------------------------------------------------
+
+# Pin model weights in RAM to prevent swapping during long batch runs.
+# Only enable if you have at least (model_size + 2 GB) of free RAM.
+use_mlock: false
+
+# Enable flash attention (~20-40% faster on CPUs with AVX2/AVX512).
+# Safe to try; will silently fall back if unsupported.
+flash_attn: false
+
+# ----------------------------------------------------------
+# Inference control
+# ----------------------------------------------------------
+
+# Per-row timeout in seconds. If inference takes longer, the row is retried.
+infer_timeout_sec: 60
+
+# Number of retry attempts after a timeout or transient error.
+# Total attempts = infer_retries + 1.
+infer_retries: 2
+
+# ----------------------------------------------------------
+# Run behaviour
+# ----------------------------------------------------------
+
+# "prod" — production mode: minimal logging, redaction on, no prompt dumps.
+# "test" — test mode:       response previews logged, integrity errors raise.
+# "dev"  — dev mode:        full prompt/response dumps, all debug output.
+run_mode: prod
+
+# Logging verbosity: DEBUG | INFO | WARNING | ERROR
+log_level: INFO
+
+# true = emit one JSON object per log line (for Splunk, ELK, etc.)
+# false = human-readable text format
+json_logs: false
+
+# true = redact email addresses and account numbers from logs.
+# Disable only in dev/test when you need to inspect raw values.
+redact_logs: true
+
+# true = skip writing per-row inference JSON telemetry files.
+# Use in production if disk space is a concern.
+no_records: false
+
+# true = log the full prompt text for each row. Only useful in dev/test.
+# Warning: generates large log files.
+log_prompts: false
+
+# Path for the run log file. Auto-named in logs/ if blank.
+# Example auto-name: logs/email_intent_20260407_120000.log
+log_file: ""
+
+# ----------------------------------------------------------
+# Telemetry
+# ----------------------------------------------------------
+
+# Directory for per-row inference JSON records.
+# Auto-named next to the output file if blank.
+# Each row produces one file: inference_records/<index>__<guid>__<ts>.json
+record_dir: ""

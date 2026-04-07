@@ -1,0 +1,78 @@
+# ============================================================
+# Email Intent Classifier — Configuration
+# ============================================================
+# Edit this file to swap models, data sources, prompts, etc.
+# CLI flags passed to main.py override any value here.
+# Secrets (SQL passwords, etc.) go in .env — NOT in this file.
+# ============================================================
+
+# ----------------------------------------------------------
+# Paths
+# ----------------------------------------------------------
+model_path:  models/mistral-7b-instruct-v0.2.Q4_K_M.gguf
+kb_file:     data/SPSS_Category_Concepts.xlsx
+prompt_file: prompts/system_prompt.txt   # set to "" to use built-in hardcoded prompt
+
+# ----------------------------------------------------------
+# Data source  ("parquet" | "sql")
+# ----------------------------------------------------------
+data_source: parquet
+
+# Input / output when data_source = parquet
+parquet_in:  data/emails.parquet
+parquet_out: ""                          # auto-named next to parquet_in if blank
+
+# Output column name in the parquet
+out_col: Predicted_Reduced_Category
+
+# ----------------------------------------------------------
+# SQL Server  (used when data_source = sql)
+# Load secrets from .env:  SQL_UID / SQL_PWD
+# ----------------------------------------------------------
+sql_server:   ""                         # e.g. GENESYSCICDBQA.corp.hydro.one
+sql_database: EMAIL
+sql_table:    "[dbo].[Original_Email]"
+sql_trusted:  true                       # true = Windows Auth; false = SQL Auth
+sql_batch:    100                        # rows fetched per run (sql source)
+sql_dry_run:  false                      # true = predict but do NOT write back
+
+# ----------------------------------------------------------
+# LLM settings
+# ----------------------------------------------------------
+n_ctx:          8192
+n_gpu_layers:   0
+n_batch:        512
+max_tokens:     256
+temperature:    0.05
+top_p:          0.90
+top_k:          10
+repeat_penalty: 1.1
+max_keywords:   5                        # hint terms shown per category in prompt
+
+# ----------------------------------------------------------
+# GGUF best practices
+# ----------------------------------------------------------
+use_mlock:  false    # pin model in RAM (requires free RAM >= model size)
+flash_attn: false    # ~30% faster on AVX2/AVX512 CPUs
+
+# ----------------------------------------------------------
+# Inference control
+# ----------------------------------------------------------
+infer_timeout_sec: 60
+infer_retries:     2
+
+# ----------------------------------------------------------
+# Run behaviour  ("dev" | "test" | "prod")
+# ----------------------------------------------------------
+run_mode:    prod
+log_level:   INFO    # DEBUG | INFO | WARNING | ERROR
+json_logs:   false   # true = one JSON object per log line (for log aggregators)
+redact_logs: true    # redact emails / account numbers in logs
+no_records:  false   # true = skip per-row JSON telemetry files
+log_prompts: false   # true = log full prompt text (dev/test only)
+log_file:    ""      # auto-named in logs/ if blank
+
+# ----------------------------------------------------------
+# Telemetry
+# ----------------------------------------------------------
+record_dir: ""       # auto-named next to output if blank
