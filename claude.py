@@ -341,7 +341,99 @@ def load_reduced_kb(
         category_terms.setdefault(code, []).extend(terms)
 
     log.info("kb_loaded", extra={"file_in": path, "model": f"{len(valid_labels)} categories"})
+
+    # Warn when cross-category term overlap is high — shared terms are less
+    # discriminative and degrade classification quality, especially with many categories.
+    term_counts = _compute_term_category_counts(category_terms)
+    shared      = {t: c for t, c in term_counts.items() if c > 1}
+    if shared:
+        top_shared = sorted(shared.items(), key=lambda x: -x[1])[:10]
+        overlap_pct = round(len(shared) / max(len(term_counts), 1) * 100, 1)
+        log.warning(
+            "kb_term_overlap_detected",
+            extra={
+                "shared_terms_count":  len(shared),
+                "total_unique_terms":  len(term_counts),
+                "overlap_pct":         overlap_pct,
+                "top_shared_examples": [f"{t}({c})" for t, c in top_shared[:5]],
+                "impact": (
+                    "High overlap reduces prompt discriminativeness and may cause "
+                    "misclassification. Consider consolidating shared terms into a "
+                    "single canonical category or removing generic shared terms."
+                ),
+            },
+        )
+
     return valid_labels, category_terms
+
+
+# --------------------------------------------------
+# TERM DISCRIMINATIVENESS HELPERS
+# --------------------------------------------------
+
+# Number of hint slots distributed across ALL categories before per-category
+# scaling kicks in.  With max_keywords=5 this keeps total hints at ~50 terms
+# for up to 10 categories, then scales down to preserve context-window budget.
+KB_HINTS_TOTAL_BUDGET = 50
+
+
+def _normalize_term(t: str) -> str:
+    """Lowercase and strip a single term string."""
+    return t.lower().strip()
+
+
+def _compute_term_category_counts(
+    category_terms: Dict[str, List[str]],
+) -> Dict[str, int]:
+    """
+    Returns a mapping of each unique term (lowercased, stripped) to the number
+    of categories it appears in.
+
+    A term that appears in only one category is fully discriminative (count = 1).
+    A term shared across many categories is less discriminative and is deprioritised
+    in the prompt hints to reduce ambiguity for the LLM.
+
+    Impact when the KB grows:
+    - More categories → higher chance of common/generic terms appearing in multiple
+      categories → more prompt noise → degraded classification accuracy.
+    - This function makes that overlap visible so it can be acted on.
+    """
+    counts: Dict[str, int] = {}
+    for terms in category_terms.values():
+        seen_in_this_cat: set = set()
+        for t in terms:
+            t = _normalize_term(t)
+            if t and t not in seen_in_this_cat:
+                counts[t] = counts.get(t, 0) + 1
+                seen_in_this_cat.add(t)
+    return counts
+
+
+def _rank_terms_by_discriminativeness(
+    terms: List[str],
+    term_category_counts: Dict[str, int],
+) -> List[str]:
+    """
+    Returns *terms* deduplicated and sorted so the most category-exclusive
+    (discriminative) terms appear first.
+
+    Sort key (all ascending):
+      1. Number of categories the term appears in — fewer is better (more unique).
+      2. Word count — shorter phrases are cheaper in tokens.
+      3. String length — shorter is cheaper in tokens.
+
+    This ordering ensures that when ``max_keywords`` is applied the LLM sees
+    the most distinguishing hints for every category, even when the KB is large.
+    """
+    deduped = list(dict.fromkeys(_normalize_term(t) for t in terms if _normalize_term(t)))
+    return sorted(
+        deduped,
+        key=lambda t: (
+            term_category_counts.get(t, 1),  # ascending: exclusive terms first
+            len(t.split()),                  # ascending: fewer words first
+            len(t),                          # ascending: shorter strings first
+        ),
+    )
 
 
 # --------------------------------------------------
@@ -391,13 +483,32 @@ def build_system_prompt(
     )
 
     # Fix 1: Markdown header for hints (compact format preserved for token efficiency)
+    #
+    # Two improvements for large knowledge bases:
+    #
+    # 1. Dynamic max_keywords scaling — with many categories the hints block grows
+    #    linearly and can push the system prompt past SYSTEM_PROMPT_MAX_RATIO of the
+    #    context window.  The per-category budget is capped so that the total number
+    #    of hint terms stays close to KB_HINTS_TOTAL_BUDGET regardless of how many
+    #    categories the KB contains.  Floor is 3 so every category retains at least
+    #    a few discriminative signals.
+    #
+    # 2. Discriminativeness-first term ranking — sort terms so the ones unique to
+    #    THIS category appear first, ahead of generic terms shared across many
+    #    categories.  When max_keywords is applied, the LLM therefore sees the
+    #    most distinguishing hints rather than the most common ones.
+    n_cats = len(category_labels)
+    per_cat_budget = KB_HINTS_TOTAL_BUDGET // max(n_cats, 1)
+    effective_max  = max(3, min(max_keywords, per_cat_budget))
+
+    term_category_counts = _compute_term_category_counts(category_terms)
+
     compact_hints = []
     for code in category_labels:
         terms = category_terms.get(code, [])
         if terms:
-            deduped = list(dict.fromkeys(t.lower().strip() for t in terms if t.strip()))
-            deduped_sorted = sorted(deduped, key=lambda t: (len(t.split()), len(t)))
-            compact_hints.append(f"- {code}: {', '.join(deduped_sorted[:max_keywords])}")
+            ranked = _rank_terms_by_discriminativeness(terms, term_category_counts)
+            compact_hints.append(f"- {code}: {', '.join(ranked[:effective_max])}")
 
     hints_block = (
         "# Keyword Hints\n"
